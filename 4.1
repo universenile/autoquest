@@ -1,0 +1,665 @@
+--// ⚙️ AUTO QUEST v4.1 — Strict Match + TP + QuestIndicator + Interactables + M1/M2 + FarNpcStorage retry
+--// Single-file LocalScript. Plug & play.
+
+--------------------------
+-- Services & bootstrap --
+--------------------------
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace         = game:GetService("Workspace")
+
+local player = Players.LocalPlayer
+
+repeat task.wait() until game:IsLoaded()
+repeat task.wait() until Workspace:FindFirstChild("FriendlyNpcs") and ReplicatedStorage:FindFirstChild("Requests")
+
+local function getChar()
+	return player.Character or player.CharacterAdded:Wait()
+end
+
+local function InputRemote()
+	local bp = player:WaitForChild("Backpack", 9e9)
+	return bp:WaitForChild("Input", 9e9)
+end
+
+-----------------
+-- HUD / Status --
+-----------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "QuestStatusGui"
+gui.ResetOnSpawn = false
+gui.Parent = player:WaitForChild("PlayerGui")
+
+local label = Instance.new("TextLabel", gui)
+label.Size = UDim2.fromScale(0.5, 0.05)
+label.Position = UDim2.fromScale(0.25, 0.02)
+label.BackgroundTransparency = 0.35
+label.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+label.Font = Enum.Font.SourceSansBold
+label.TextScaled = true
+label.TextColor3 = Color3.fromRGB(255, 255, 255)
+label.Text = "Auto Quest: ready"
+
+local function say(t)
+	label.Text = t
+end
+
+local function log(t)
+	print("[QUEST] " .. t)
+	say(t)
+end
+
+-----------------
+-- Safe waits  --
+-----------------
+local function waitExact(sec)
+	local t = os.clock()
+	repeat task.wait() until os.clock() - t >= sec
+end
+
+-----------------------------
+-- Noclip (on during TP)  --
+-----------------------------
+local noclip = false
+
+RunService.Stepped:Connect(function()
+	if not noclip then return end
+	local ch = player.Character
+	if not ch then return end
+	for _, p in ipairs(ch:GetChildren()) do
+		if p:IsA("BasePart") then
+			p.CanCollide = false
+		end
+	end
+end)
+
+-----------------------------
+-- QuestIndicator helpers  --
+-----------------------------
+local function findNpcFolder()
+	return Workspace:FindFirstChild("FriendlyNpcs")
+end
+
+local function findFarFolder()
+	return Workspace:FindFirstChild("FarNpcStorage")
+end
+
+local function getNpcModel(npcName)
+	local near = findNpcFolder()
+	if near and near:FindFirstChild(npcName) then
+		return near[npcName], "near"
+	end
+	local far = findFarFolder()
+	if far and far:FindFirstChild(npcName) then
+		return far[npcName], "far"
+	end
+	return nil, nil
+end
+
+local function hasQuestIndicator(npcName)
+	local model = select(1, getNpcModel(npcName))
+	return model and model:FindFirstChild("QuestIndicator") ~= nil
+end
+
+------------------------------------
+-- Instant TP (with Far retrying) --
+------------------------------------
+local function teleportToPosition(pos)
+	local ch  = getChar()
+	local hrp = ch:WaitForChild("HumanoidRootPart")
+	noclip = true
+	hrp.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0))
+	task.wait(0.05)
+	noclip = false
+end
+
+local function tpToNpc(npcName, maxRetries)
+	maxRetries = maxRetries or 25
+	for i = 1, maxRetries do
+		local npc, where = getNpcModel(npcName)
+		if npc then
+			local root = npc:FindFirstChild("HumanoidRootPart") or npc.PrimaryPart
+			if root then
+				log(("🧭 TP to %s (%s) [try %d/%d]"):format(npcName, where, i, maxRetries))
+				teleportToPosition(root.Position)
+				task.wait(0.25)
+				if where == "near" then
+					return true
+				end
+			end
+		else
+			log(("⌛ Waiting for NPC %s [try %d/%d]"):format(npcName, i, maxRetries))
+		end
+		task.wait(0.25)
+	end
+	log("⚠️ Failed to TP to " .. npcName)
+	return false
+end
+
+------------------------
+-- Chat (5x retry)    --
+------------------------
+local function fireInput(payload)
+	InputRemote():FireServer(unpack(payload))
+end
+
+local CHAT_START = "startchat"
+local CHAT_ADV   = "chatadvance"
+
+local function startChat(npcName)
+	local npc = select(1, getNpcModel(npcName))
+	if not npc then return false end
+
+	for attempt = 1, 5 do
+		local ok = pcall(function()
+			fireInput({ CHAT_START, npc })
+		end)
+		if ok then
+			waitExact(1.0)
+			return true
+		end
+
+		local ok2 = pcall(function()
+			fireInput({ "StartChat", npc })
+		end)
+		if ok2 then
+			waitExact(1.0)
+			return true
+		end
+
+		task.wait(0.3)
+	end
+
+	log("⚠️ startChat failed: " .. npcName)
+	return false
+end
+
+local function advanceChat(answer)
+	for attempt = 1, 5 do
+		local ok = pcall(function()
+			if answer then
+				fireInput({ CHAT_ADV, answer })
+			else
+				fireInput({ CHAT_ADV })
+			end
+		end)
+		if ok then
+			waitExact(1.0)
+			return true
+		end
+
+		local ok2 = pcall(function()
+			if answer then
+				fireInput({ "ChatAdvance", answer })
+			else
+				fireInput({ "ChatAdvance" })
+			end
+		end)
+		if ok2 then
+			waitExact(1.0)
+			return true
+		end
+
+		task.wait(0.3)
+	end
+
+	log("⚠️ advanceChat failed")
+	return false
+end
+
+local function acceptQuest(npcName, steps)
+	if not hasQuestIndicator(npcName) then
+		log("🚫 Skipping " .. npcName .. " (no QuestIndicator)")
+		return false
+	end
+
+	tpToNpc(npcName)
+	startChat(npcName)
+
+	for _, s in ipairs(steps) do
+		if s == true then
+			advanceChat()
+		else
+			advanceChat(s)
+		end
+	end
+
+	task.wait(0.2)
+	return true
+end
+
+local function finishQuestAt(npcName, steps)
+	tpToNpc(npcName)
+	startChat(npcName)
+
+	for _, s in ipairs(steps) do
+		if s == true then
+			advanceChat()
+		else
+			advanceChat(s)
+		end
+	end
+
+	task.wait(0.2)
+end
+
+----------------------------
+-- Combat (exact-match)  --
+----------------------------
+local EnemyAlias = {
+	["blk"]   = "black scorpion",
+	["scorp"] = "scorpion",
+	["tnk"]   = "tank",
+	["stnk"]  = "shielded tank",
+}
+
+local function normalizeWanted(name)
+	if not name then return "" end
+	local key = string.lower(tostring(name))
+	if EnemyAlias[key] then
+		return EnemyAlias[key]
+	end
+	return key
+end
+
+local function matchesEnemy(modelName, wanted)
+	local n1 = string.lower(modelName)
+	local n2 = normalizeWanted(wanted)
+	return n1 == n2
+end
+
+local function doM1()
+	fireInput({ "m1", { shift = false, running = false, velo = Vector3.new(), inair = false } })
+end
+
+local function doM2()
+	fireInput({ "m2", { shift = false, running = false, velo = Vector3.new(), inair = false } })
+end
+
+local function faceHrpTowards(hrp, targetPos)
+	hrp.CFrame = CFrame.new(hrp.Position, targetPos)
+end
+
+local function fightOne(enemyModel)
+	local ehum  = enemyModel:FindFirstChildWhichIsA("Humanoid")
+	local eroot = enemyModel:FindFirstChild("HumanoidRootPart") or enemyModel.PrimaryPart
+	if not (ehum and eroot) then return end
+
+	local cam = Workspace.CurrentCamera
+
+	while ehum.Health > 0 do
+		local ch    = getChar()
+		local hrp   = ch:WaitForChild("HumanoidRootPart")
+		local myHum = ch:FindFirstChildOfClass("Humanoid")
+
+		if not myHum or myHum.Health <= 0 then
+			player.CharacterAdded:Wait()
+			task.wait(1.2)
+		else
+			if not eroot.Parent then break end
+
+			local dir    = (eroot.Position - hrp.Position).Unit
+			local anchor = eroot.Position - dir * 6
+
+			faceHrpTowards(hrp, eroot.Position)
+			hrp.CFrame = CFrame.new(anchor, eroot.Position)
+			cam.CFrame = CFrame.lookAt(cam.CFrame.Position, eroot.Position)
+
+			for i = 1, 3 do
+				doM1()
+				task.wait(0.22)
+			end
+			if math.random() < 0.35 then
+				doM2()
+				task.wait(0.3)
+			end
+		end
+	end
+end
+
+local function fightExactList(orderList)
+	local enemiesFolder = Workspace:WaitForChild("Enemies")
+
+	for _, pair in ipairs(orderList) do
+		local wanted, needed = pair[1], pair[2]
+		local done = 0
+
+		while done < needed do
+			local target, nearest = nil, math.huge
+			local ch  = getChar()
+			local hrp = ch:WaitForChild("HumanoidRootPart")
+
+			for _, m in ipairs(enemiesFolder:GetChildren()) do
+				if m:IsA("Model") and matchesEnemy(m.Name, wanted) then
+					local hum  = m:FindFirstChildWhichIsA("Humanoid")
+					local root = m:FindFirstChild("HumanoidRootPart")
+					if hum and root and hum.Health > 0 then
+						local d = (root.Position - hrp.Position).Magnitude
+						if d < nearest then
+							nearest = d
+							target  = m
+						end
+					end
+				end
+			end
+
+			if target then
+				log("⚔️ " .. target.Name .. " (" .. (done + 1) .. "/" .. needed .. ")")
+				fightOne(target)
+				local hum = target:FindFirstChildWhichIsA("Humanoid")
+				if not hum or hum.Health <= 0 then
+					done += 1
+				end
+				task.wait(0.25)
+			else
+				log("🔎 Waiting for " .. tostring(wanted) .. " (" .. done .. "/" .. needed .. ")")
+				task.wait(0.6)
+			end
+		end
+
+		log("✅ " .. tostring(wanted) .. " x" .. needed .. " complete")
+		task.wait(0.3)
+	end
+end
+
+--------------------------
+-- Interactables helpers --
+--------------------------
+local function interactSingle(objectName)
+	local folder = Workspace:WaitForChild("Interactable", 9e9)
+	local evt    = ReplicatedStorage:WaitForChild("Requests", 9e9):WaitForChild("Interact", 9e9)
+	local obj    = folder:FindFirstChild(objectName)
+
+	if not obj then
+		log("⚠️ Missing interactable: " .. objectName)
+		return false
+	end
+
+	teleportToPosition(obj.Position)
+	task.wait(0.2)
+	evt:FireServer(obj)
+	task.wait(0.25)
+	return true
+end
+
+local function interactNumbered(baseName, count)
+	for i = 1, count do
+		interactSingle(baseName .. i)
+	end
+end
+
+------------------------------
+-- Quest bookkeeping        --
+------------------------------
+local completed = {}
+
+local function isDone(q)
+	return completed[q] == true
+end
+
+local function done(q)
+	completed[q] = true
+	log("✅ Completed " .. q)
+end
+
+------------------------------
+-- QUEST DEFINITIONS         --
+------------------------------
+
+-- 1) Chichi Quest 1 — 5 Snakes
+local function runChichiQuest1()
+	local q = "Chichi Quest 1"
+	if isDone(q) then return end
+
+	if not acceptQuest("Chichi", { true, true, "Yeah", true }) then return end
+	fightExactList({ { "Snake", 5 } })
+	finishQuestAt("Chichi", { true, "Sure", true })
+	done(q)
+end
+
+-- 2) Chichi Quest 2 — uses "Sure", then Gohan chat
+local function runChichiQuest2()
+	local q = "Chichi Quest 2"
+	if isDone(q) then return end
+
+	if not acceptQuest("Chichi", { true, true, "Sure", true }) then return end
+	tpToNpc("Gohan")
+	startChat("Gohan")
+	advanceChat()
+	advanceChat()
+	done(q)
+end
+
+-- 3) Gohan Quest 1 — 5 Thug then 2 Brute
+local function runGohanQuest1()
+	local q = "Gohan Quest 1"
+	if isDone(q) then return end
+
+	if not acceptQuest("Gohan", { true, "Sure", true }) then return end
+	fightExactList({ { "Thug", 5 }, { "Brute", 2 } })
+	finishQuestAt("Gohan", { true, true })
+	done(q)
+end
+
+-- 4) Police Chief Quest — 5 Corrupt Officer
+local function runPoliceChiefQuest()
+	local q = "Police Chief Quest"
+	if isDone(q) then return end
+
+	if not acceptQuest("Police Chief", { true, "Yes", true }) then return end
+	fightExactList({ { "Corrupt Officer", 5 } })
+	finishQuestAt("Police Chief", { true, true })
+	done(q)
+end
+
+-- 5) Baseball Quest — BaseballObject1..5
+local function runBaseballQuest()
+	local q = "Baseball Quest"
+	if isDone(q) then return end
+
+	if not acceptQuest("OrangeStarBaseballQuest", { true, true, "Yeah", true }) then return end
+	interactNumbered("BaseballObject", 5)
+	done(q)
+end
+
+-- 6) Young Man Quest — Suitcase
+local function runYoungManQuest()
+	local q = "Young Man Quest"
+	if isDone(q) then return end
+
+	-- original: advance, "Yes", advance
+	if not acceptQuest("Young Man", { true, "Yes", true }) then return end
+
+	interactSingle("Suitcase")
+
+	-- turn-in: advance, "Sure", advance
+	finishQuestAt("Young Man", { true, "Sure", true })
+	done(q)
+end
+
+-- 7) Quest Giver 11 (Interact) — Krillin 3x advance
+local function runQuestGiver11_Interact()
+	local q = "Quest Giver 11 (Interact)"
+	if isDone(q) then return end
+
+	if not acceptQuest("Quest Giver 11", { true, true, "Yes", true }) then return end
+
+	tpToNpc("Krillin")
+	startChat("Krillin")
+	advanceChat()
+	advanceChat()
+	advanceChat()
+
+	finishQuestAt("Quest Giver 11", { true, true })
+	done(q)
+end
+
+-- 8) Quest Giver 4 — AncientRelic, BLK x2, Scorp x4
+local function runQuestGiver4()
+	local q = "Quest Giver 4"
+	if isDone(q) then return end
+
+	if not acceptQuest("Quest Giver 4", { true, "Yes", true }) then return end
+
+	interactSingle("AncientRelic")
+	fightExactList({ { "BLK", 2 }, { "Scorp", 4 } })
+
+	-- original: advance, "Sure", advance
+	finishQuestAt("Quest Giver 4", { true, "Sure", true })
+	done(q)
+end
+
+-- 9) Red Ribbon Giver Quest — Tnk, RR Soldier, RR Gunner, Stnk
+local function runRedRibbonGiverQuest()
+	local q = "Red Ribbon Giver Quest"
+	if isDone(q) then return end
+
+	if not acceptQuest("Red Ribbon Giver", { true, "Yes", true }) then return end
+
+	fightExactList({
+		{ "Tnk", 5 },
+		{ "Red Ribbon Soldier", 8 },
+		{ "Red Ribbon Gunner", 5 },
+		{ "Stnk", 2 },
+	})
+
+	finishQuestAt("Red Ribbon Giver", { true, true })
+	done(q)
+end
+
+-- 10) Piccolo Quest — PicObj1..4
+local function runPiccoloQuest()
+	local q = "Piccolo Quest"
+	if isDone(q) then return end
+
+	if not acceptQuest("Piccolo", { true, true, "Train Me", true }) then return end
+	-- numbered PicObj1..4
+	interactNumbered("PicObj", 4)
+	done(q)
+end
+
+-- 11) The Hunter Quest — 4 Gorilla, 4 Bear
+local function runTheHunterQuest()
+	local q = "The Hunter Quest"
+	if isDone(q) then return end
+
+	if not acceptQuest("The Hunter", { true, "Yes", true }) then return end
+	fightExactList({ { "Gorilla", 4 }, { "Bear", 4 } })
+	finishQuestAt("The Hunter", { true, true })
+	done(q)
+end
+
+-- 12) Quest Giver 29 — 4 Evil Namek
+local function runQuestGiver29()
+	local q = "Quest Giver 29"
+	if isDone(q) then return end
+
+	if not acceptQuest("Quest Giver 29", { true, "Yes", true }) then return end
+	fightExactList({ { "Evil Namek", 4 } })
+	finishQuestAt("Quest Giver 29", { true, true })
+	done(q)
+end
+
+-- 13) Fisher Joe Quest — 4 Pterodactyl, 1 Giant Boar
+local function runFisherJoeQuest()
+	local q = "Fisher Joe Quest"
+	if isDone(q) then return end
+
+	if not acceptQuest("Fisher Joe", { true, "Yes", true }) then return end
+	fightExactList({ { "Pterodactyl", 4 }, { "Giant Boar", 1 } })
+	finishQuestAt("Fisher Joe", { true, true })
+	done(q)
+end
+
+-- 14) Quest Giver 18 — 2 Yeti
+local function runQuestGiver18()
+	local q = "Quest Giver 18"
+	if isDone(q) then return end
+
+	if not acceptQuest("Quest Giver 18", { true, "Yes", true }) then return end
+	fightExactList({ { "Yeti", 2 } })
+	finishQuestAt("Quest Giver 18", { true, true })
+	done(q)
+end
+
+-- 15) Quest Giver 17 — Spaceship + 3 Alien
+local function runQuestGiver17()
+	local q = "Quest Giver 17"
+	if isDone(q) then return end
+
+	if not acceptQuest("Quest Giver 17", { true, "Yes", true }) then return end
+	interactSingle("Spaceship")
+	fightExactList({ { "Alien", 3 } })
+	finishQuestAt("Quest Giver 17", { true, true })
+	done(q)
+end
+
+-- 16) Quest Giver 16 — 10 Purple Fighter
+local function runQuestGiver16()
+	local q = "Quest Giver 16"
+	if isDone(q) then return end
+
+	if not acceptQuest("Quest Giver 16", { true, "Yes", true }) then return end
+	fightExactList({ { "Purple Fighter", 10 } })
+	finishQuestAt("Quest Giver 16", { true, true })
+	done(q)
+end
+
+-- 17) Treasure Hunter — placeholder interactables (update names)
+local function runTreasureHunterQuest()
+	local q = "Treasure Hunter Quest"
+	if isDone(q) then return end
+
+	if not acceptQuest("Treasure Hunter", { true, "Yes", true }) then return end
+
+	local tried = 0
+	tried = tried + (interactSingle("TreasureRelic1") and 1 or 0)
+	tried = tried + (interactSingle("TreasureRelic2") and 1 or 0)
+	tried = tried + (interactSingle("BlueTreasure1") and 1 or 0)
+	tried = tried + (interactSingle("BlueTreasure2") and 1 or 0)
+	log("🔹 Treasure interact attempts: " .. tostring(tried) .. " (update names if needed)")
+
+	finishQuestAt("Treasure Hunter", { true, true })
+	done(q)
+end
+
+-------------------------
+-- Chain (your order)  --
+-------------------------
+local chain = {
+	runChichiQuest1,          -- 1
+	runChichiQuest2,          -- 2
+	runGohanQuest1,           -- 3
+	runPoliceChiefQuest,      -- 4
+	runBaseballQuest,         -- 5
+	runYoungManQuest,         -- 6
+	runQuestGiver11_Interact, -- 7
+	runQuestGiver4,           -- 8
+	runRedRibbonGiverQuest,   -- 9
+	runPiccoloQuest,          -- 10
+	runTheHunterQuest,        -- 11
+	runQuestGiver29,          -- 12
+	runFisherJoeQuest,        -- 13
+	runQuestGiver18,          -- 14
+	runQuestGiver17,          -- 15
+	runQuestGiver16,          -- 16
+	runTreasureHunterQuest,   -- 17
+}
+
+-------------------------
+-- Execute
+-------------------------
+log("⚙️ Running Auto Quest v4.1 (Strict Match)")
+
+for i, fn in ipairs(chain) do
+	local ok, err = pcall(fn)
+	if not ok then
+		warn("[QUEST] step " .. i .. " error: ", err)
+		task.wait(1.2)
+		pcall(fn)
+	end
+	task.wait(0.5)
+end
+
+log("🌟 Auto quest chain done.")
